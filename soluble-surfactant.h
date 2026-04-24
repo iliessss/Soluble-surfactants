@@ -1,17 +1,111 @@
+/**
+# Soluble surfactant transport
+
+This module solves the coupled transport of a soluble surfactant between
+the bulk fluid and a moving fluid--fluid interface, in the hybrid
+Volume-of-Fluid / Phase-Field framework of [Haouche *et al.*,
+2026](#haouche2026) (extending the insoluble formulation of
+[Farsoiya *et al.*, 2024](#farsoiya2024) to the soluble case).
+
+Two scalar fields are evolved in time:
+
+* `ci` : the *interfacial* surfactant concentration $f(\mathbf{x},t)$,
+  a volumetric proxy for the surface concentration
+  $\Gamma(\mathbf{x},t)$. It is localised in a thin layer of thickness
+  $\epsilon$ around the interface through the phase-field
+  $\phi(\mathbf{x},t)$.
+* `cb` : the *bulk* surfactant concentration $F(\mathbf{x},t)$. It is
+  transported in the exterior fluid ($\phi \to 0$) and exchanges mass
+  with `ci` through the adsorption/desorption source term.
+
+Both equations take the generalised elliptic form (see Appendix~B of
+the paper)
+$$
+\nabla\!\cdot\!\bigl(\alpha\,\nabla c + \boldsymbol{\beta}\,c\bigr)
+  + \lambda\,c = b,
+$$
+where $\boldsymbol{\beta}$ is an anti-diffusive flux aligned with the
+interface normal (Jain's ACDI sharpening,
+[Jain, 2022](#jain2022)). The system is solved with a custom multigrid
+using the `h_relax` / `h_residual` pair defined below (the standard
+Basilisk `diffusion.h` solver does not support the $\boldsymbol{\beta}$
+term).
+
+The phase-field $\phi$ (`pfield`) is reconstructed from the VoF
+signed distance $\chi$ (`d2` in the code) via the tanh profile
+$$
+\phi = \tfrac{1}{2}\bigl(1 - \tanh(\chi / 2\epsilon)\bigr),
+$$
+and optionally advected/regularised by the ACDI equation at each time
+step.
+
+## Dependencies
+*/
+
 #include "redistance2.h"
 #include "diffusion.h"
 #include "tracer.h"
 
+/**
+## Interface thickness
+
+The regularisation length $\epsilon$ is set to $0.75\,\Delta x$ at
+the finest level, so that the tanh profile of $\phi$ resolves the
+interface over $\sim 3$ cells.
+*/
+
 #define EPSILON ((L0/(1 << grid->maxdepth))*0.75)
-//#define EPSILON 0.08//((L0/(1 << grid->maxdepth))*0.25)
+
+/**
+## Runtime switches
+
+* `advect_diff_phase_field` --- when `1`, the ACDI
+  advection--sharpening equation is solved for `pfield`. When `0`,
+  `pfield` is only reconstructed from the signed distance `d2`.
+  The flag is set automatically in [`properties2`](#properties2)
+  depending on `reinit_skip_steps`.
+* `reinit_skip_steps` --- number of time steps between two
+  redistance operations on `d2`. Large values privilege ACDI
+  transport; `reinit_skip_steps = 1` reduces to pure level-set
+  reconstruction.
+* `surfactant` --- master switch. When `0` the module is dormant
+  (useful for clean-interface runs).
+* `counter` --- internal time-step counter used by the redistance
+  scheduler.
+*/
 
 bool advect_diff_phase_field = 0;
 int reinit_skip_steps = 100;
 bool surfactant = 1;
 int counter = 0;
 
+/**
+## Fields
+
+`ci` and `cb` are the interfacial and bulk concentrations. `d2` is the
+signed distance function, `pfield` the phase-field, `gamma2` a
+user-accessible surface density field. All of them are VoF tracers so
+they are advected with the interface-capturing scheme in
+[`tracer.h`](/src/tracer.h). */
+
 scalar ci[], cb[], gamma2[], d2[], pfield[];
 scalar * tracers = {ci, cb, d2, pfield};
+
+/**
+## Physical parameters
+
+| Symbol       | Code name                  | Meaning                                                              |
+|--------------|----------------------------|----------------------------------------------------------------------|
+| $\zeta$      | `zeta`                     | ACDI sharpening velocity (set dynamically from $|\mathbf{u}|_{\max}$) |
+| $D_f$        | `Di0`                      | Interfacial diffusion coefficient                                    |
+| $D_F$        | `Db0`                      | Bulk diffusion coefficient                                           |
+| $r_a$        | `ra`                       | Adsorption rate                                                      |
+| $r_d$        | `rd`                       | Desorption rate                                                      |
+| $f_\infty$   | `c_hat_inf`                | Saturation (maximum packing) concentration                           |
+| $\varepsilon_{\text{reg}}$ | `varepsilon` | Numerical regularisation for $\log$ / division by zero             |
+| $k_s$        | `sharpening_coefficient`   | ACDI interface-sharpening coefficient (default $2$)                  |
+| -            | `inverse_pfield`           | Sign convention: $\phi$ or $1-\phi$ is the "inside" phase            |
+*/
 
 double zeta = 1. [*];
 double Di0 = 0.01 [*], Db0 = 0.01 [*];
@@ -20,6 +114,19 @@ double c_hat_inf = 1. [*];
 double varepsilon = 1.e-12;
 double sharpening_coefficient = 2.;
 double inverse_pfield = 1; //inverting the field according to problem
+
+/**
+## Generalised diffusion multigrid
+
+We solve the linear system
+$$
+\nabla\!\cdot\!\bigl(D\,\nabla c + \boldsymbol{\beta}\,c\bigr)
+  + \lambda\,c = b
+$$
+with a geometric multigrid. The coefficients are packed in
+`HDiffusion`. The Jacobi relaxation `h_relax` and the residual
+`h_residual` follow the second-order finite-volume discretisation
+described in Section~3.2 and Appendix~A of the paper. */
 
 struct HDiffusion {
     face vector D;
@@ -79,10 +186,28 @@ static double h_residual(scalar *al, scalar *bl, scalar *resl, void *data) {
     return maxres;
 }
 
+/**
+## Stability {#stability}
+
+The time step is bounded by a CFL-like condition that aggregates the
+ACDI diffusion, the anti-diffusive sharpening flux, and the physical
+diffusivities $D_f$, $D_F$:
+$$
+\Delta t \leq 0.75
+  \frac{\Delta x^2}{\zeta\,\epsilon},\,\,\,\Delta t \leq 0.75
+  \frac{\Delta x^2}{2d\,\text{max}(D_f,\,D_F)},
+$$
+with $d$ the spatial dimension (factor $2d = 4$ in 2D/axi, $6$ in 3D).
+
+$\zeta$ is set to $1.1\,|\mathbf{u}|_{\max}$ evaluated *at the
+interface only* (weighted by $\delta_\phi = \phi(1-\phi)/\epsilon$),
+which avoids stiffening $\Delta t$ with large bulk velocities far from
+the interface. */
+
 event stability(i++) {
     double maxvel = 1.e-6 [*];
     double Dmax = max(Di0, Db0);
-    
+
     if (surfactant) {
         foreach_face(reduction(max:maxvel)) {
             if (u.x[] != 0.) {
@@ -97,7 +222,7 @@ event stability(i++) {
         deltaxmin = L0 / (1 << grid->maxdepth);
         zeta = 1.1*maxvel;
         double dt = dtmax;
-        
+
         if (advect_diff_phase_field) {
             dt = 0.75*sq(deltaxmin) / zeta / EPSILON;
             if (dt < dtmax) dtmax = dt;
@@ -110,11 +235,30 @@ event stability(i++) {
     }
 }
 
+/**
+## Safe clamp
+
+Clips a value to $[0,1]$ with a small guard band to avoid
+`log(0)` / division by zero in the ACDI formulation. */
+
 double clamp2(double a) {
     if (a < 1.e-6) return 0;
     else if (a > 1. - 1.e-6) return 1.;
     else return a;
 }
+
+/**
+## Phase-field reconstruction {#properties2}
+
+Every `reinit_skip_steps` time steps, the signed distance `d2` is
+recomputed from the volume fraction `f` by fast-marching
+(`redistance`) and the phase-field is rebuilt from the tanh profile.
+
+A sanity check on the amplitude of the signed distance rejects
+pathological redistance results (e.g. early in the simulation when the
+interface is not yet well-formed): in that case the redistance is
+retried at the next time step.
+*/
 
 event properties2(i++) {
     if (reinit_skip_steps > 1) advect_diff_phase_field = 1;
@@ -130,7 +274,7 @@ event properties2(i++) {
         restriction({d2temp});
 #endif
         redistance(d2temp, imax = 0.5*(1 << grid->maxdepth));
-        
+
         double d2max = statsf(d2temp).max;
         double d2min = statsf(d2temp).min;
         bool signed_distance_faulty = 0;
@@ -152,6 +296,46 @@ event properties2(i++) {
     counter ++;
 }
 
+/**
+## Coupled surfactant solve
+
+This is the core event. Three linear systems are solved per time step:
+
+1. **ACDI equation for the phase-field** (only when
+   `advect_diff_phase_field = 1`):
+   $$
+   \frac{\partial\phi}{\partial t}
+     = \nabla\!\cdot\!\bigl(\zeta\epsilon\,\nabla\phi
+       - \tfrac{1}{4}\zeta\,(1-\tanh^2(\psi/2\epsilon))\,\mathbf{n}\bigr),
+   $$
+   with $\psi = \epsilon\log\!\bigl(\phi/(1-\phi)\bigr)$.
+
+2. **Interfacial surfactant**
+   (Eq.~(B.15) of the paper, implicit in time):
+   $$
+   \nabla\!\cdot\!\bigl(\alpha_f\nabla f^{n+1}
+     + \boldsymbol{\beta}_f f^{n+1}\bigr) + \lambda_f f^{n+1} = b_f,
+   $$
+   $$
+   \alpha_f = -D_f,\quad
+   \boldsymbol{\beta}_f = -\mathbf{B}_f,\quad
+   \lambda_f = \tfrac{1}{\Delta t} + r_d + r_a\,\tfrac{F^{n+1}}{\phi^{n+1}},\quad
+   b_f = \tfrac{f^n}{\Delta t} + r_a\,\tfrac{F^{n+1}}{\phi^{n+1}} f_\infty.
+   $$
+
+3. **Bulk surfactant**
+   (Eq.~(B.20) of the paper):
+   $$
+   \nabla\!\cdot\!\bigl(\alpha_F\nabla F^{n+1}
+     + \boldsymbol{\beta}_F F^{n+1}\bigr) + \lambda_F F^{n+1} = b_F.
+   $$
+
+The anti-diffusive fluxes are aligned with the smoothed interface
+normal $\mathbf{n} = \nabla\psi / |\nabla\psi|$ computed from the
+ACDI potential $\psi$. The implicit source term in $\lambda_f$ ($\lambda_i$ in the code) /
+$\lambda_F$ ($\lambda_b$ in the code) stabilises the stiff adsorption/desorption kinetics.
+*/
+
 event tracer_diffusion(i++) {
     if (surfactant) {
 
@@ -160,6 +344,9 @@ event tracer_diffusion(i++) {
         face vector betai[], betab[], Di[], Db[];
         scalar ri[], rb[], lambdai[], lambdab[];
 
+        /**
+        ### 1. ACDI phase-field sharpening
+        */
         if (advect_diff_phase_field) {
             foreach() {
                 pfield[] = clamp2(pfield[]);
@@ -217,6 +404,15 @@ event tracer_diffusion(i++) {
             mg_solve({pfield}, {r}, h_residual, h_relax, &q1);
         }
 
+        /**
+        ### 2. Build cell-centred coefficients for `ci` and `cb`
+
+        `deltas` is the regularised delta function
+        $\delta_\phi = \phi(1-\phi)/\epsilon$ used to localise the
+        adsorption term. Kinetics disabled by commenting out the
+        full expression and using the *adsorption-only* variant
+        (single uncommented line below each block).
+        */
         foreach() {
             pfield[] = clamp2(pfield[]);
             double deltas = (pfield[]*(1. - pfield[]))/EPSILON;
@@ -245,10 +441,21 @@ event tracer_diffusion(i++) {
 
             //ri[] = -cm[]*(ci[]/dt + ra*cb[]*c_hat_inf*deltas/phi); // to simulate only adsorption
             ri[] = -cm[]*(ci[]/dt + ra*cb[]*c_hat_inf*deltas/phi);
- 
+
             rb[] = -cm[]*(cb[]/dt + rd*ci[]);
         }
 
+        /**
+        ### 3. Face-centred diffusion and anti-diffusive fluxes
+
+        The anti-diffusive flux $\mathbf{B}$ is aligned with the
+        interface normal computed from $\nabla\psi/|\nabla\psi|$:
+        $$
+        \mathbf{B}_f = -D_f\,k_s\,\frac{0.5 - \phi}{\epsilon}\,\mathbf{n},
+        \qquad
+        \mathbf{B}_F = -D_F\,\frac{1-\phi}{\epsilon}\,\mathbf{n}.
+        $$
+        */
         foreach_face() {
             double phif = (pfield[] + pfield[-1])/2.;
             Di.x[] = fm.x[]*Di0;
@@ -273,11 +480,18 @@ event tracer_diffusion(i++) {
 
                 betai.x[] = -Di.x[]*sharpening_coefficient*(0.5 - phif)/EPSILON*gradpsi/mag_grad_psi;
                 betab.x[] = -Db.x[]*(1. - phif)/EPSILON*gradpsi/mag_grad_psi;
-            }     
+            }
         }
-        
+
         restriction({Di, Db, betai, betab, lambdai, lambdab, cm, ri, rb});
 
+        /**
+        ### 4. Solve the two decoupled linear systems
+
+        The source terms `ri`, `rb` are treated as explicit (they use
+        $c_b^n$ and $c_i^n$); the $\lambda_i$, $\lambda_b$ coefficients
+        embed the implicit diagonal contributions from the kinetics.
+        */
         struct HDiffusion qi;
         qi.D      = Di;
         qi.beta   = betai;
@@ -289,7 +503,57 @@ event tracer_diffusion(i++) {
         qb.D      = Db;
         qb.beta   = betab;
         qb.lambda = lambdab;
-        
+
         mg_solve({cb}, {rb}, h_residual, h_relax, &qb);
-    }  
+    }
 }
+
+/**
+## Usage
+
+## Test
+
+* [Expanding circle](test_cases/expanding_circle.c)
+* [Expanding sphere](test_cases/expanding_sphere.c)
+* [Rotating circle](test_cases/rotating_circle.c)
+* [Pure adsorption on a flat interface](test_cases/pure_adsorption_flat.c)
+* [Pure adsorption on a circular interface](test_cases/pure_adsorption_circle.c)
+* [Pure adsorption on a sphere interface](test_cases/pure_adsorption_sphere.c)
+* [Pure desorption on a flat interface](test_cases/pure_desorption.c)
+* [Soluble surfactants on a flat interface](test_cases/flat_interface.c)
+* [Rising bubble in 2D-axi](test_cases/rising_bubble_axi.c)
+* [Rising bubble in 3D](test_cases/rising_bubble_3D.c)
+
+## References
+
+~~~bib
+@article{haouche2026,
+  author  = {Haouche, I. and Reichert, B. and Baudoin, M. and Farsoiya, P. K.},
+  title   = {A hybrid Volume of Fluid Phase-Field method for Direct
+             Numerical Simulations of soluble surfactant-laden
+             interfacial flows},
+  journal = {Journal of Computational Physics},
+  year    = {2026},
+  note    = {Submitted}
+}
+
+@article{farsoiya2024,
+  author  = {Farsoiya, P. K. and Popinet, S. and Stone, H. A. and
+             Deike, L.},
+  title   = {A coupled Volume-of-Fluid / Phase-Field method for
+             insoluble surfactants},
+  journal = {Journal of Fluid Mechanics},
+  year    = {2024}
+}
+
+@article{jain2022,
+  author  = {Jain, S. S.},
+  title   = {Accurate conservative phase-field method for simulation
+             of two-phase flows},
+  journal = {Journal of Computational Physics},
+  volume  = {469},
+  pages   = {111529},
+  year    = {2022}
+}
+~~~
+*/
